@@ -1,0 +1,13 @@
+#!/bin/sh
+#
+# example
+#
+# Runs a server and 3 clients.  The clients use random chunk sizes, file sizes,
+# and run times.
+#
+python server.py -p 57500 &
+python client.py -d localhost 57500 &
+python client.py -d localhost 57500 &
+python client.py -d localhost 57500 &
+jobs
+wait %1
