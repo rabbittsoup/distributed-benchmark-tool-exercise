@@ -25,6 +25,7 @@ import random
 import subprocess
 import Queue
 import traceback
+import re
 
 class ValidationError(Exception): pass
 
@@ -143,18 +144,18 @@ def main(argv):
         if (stderr): raise ValidationError("not expecting stderr")
 
         o = 0
-        lines = [line.split() for line in stdout.splitlines()]
+        lines = stdout.splitlines()
         if (not lines[-1]): del lines[-1]
         print("stdout has {} lines".format(len(lines)))
         # check for the lost mini client
         if (n > 1):
             if (len(lines) < 2): raise ValidationError("expected at least 2 lines")
             print("stdout line 0: {}".format(lines[0]))
-            if (len(lines[0]) != 3): raise ValidationError("expected 3 tokens")
-            if (lines[0][0] != "Lost"): raise ValidationError("expected Lost header line")
+            ex = r"^\s*Lost\b"
+            if (not re.match(ex, lines[0])): raise ValidationError("expected match of {}".format(repr(ex)))
             print("stdout line 1: {}".format(lines[1]))
-            if (len(lines[1]) != 3): raise ValidationError("expected 3 tokens")
-            if (not lines[1][0].endswith(threads[1][1].name)): raise ValidationError("expected 1st token to end with {}".format(repr(threads[1][1].name)))
+            ex = "".join((r"^\s*", socket.gethostbyname(host), r":", threads[1][1].name, r"\b"))
+            if (not re.match(ex, lines[1])): raise ValidationError("expected match of {}".format(repr(ex)))
             del lines[:2]
             o += 2
 
@@ -163,28 +164,29 @@ def main(argv):
         # then check at the end that we saw them all
         if (len(lines) != (n + 1)): raise ValidationError("expected {} Data lines".format(n + 1))
         print("stdout line {}: {}".format(o, lines[0]))
-        if (len(lines[0]) != 6): raise ValidationError("expected 6 tokens")
-        if (lines[0][0] != "Data"): raise ValidationError("expected Data header line")
+        ex = r"^\s*Data\b"
+        if (not re.match(ex, lines[0])): raise ValidationError("expected match of {}".format(repr(ex)))
         del lines[0]
         o += 1
         s = set()    # there should be only 1 occurance of each mini client
         for i, line in enumerate(lines):
             print("stdout line {}: {}".format(i + o, line))
-            if (len(line) != 6): raise ValidationError("expected 6 tokens")
-            try:
-                j = int(line[2])
-
-            except ValueError:
-                raise ValidationError("expected 3rd token to be an integer")
-
-            if (j in s): raise ValidationError("not expecting repeated 3rd token")
+            ex = r"^\s*(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s*$"
+            m = re.match(ex, line)
+            if (not m): raise ValidationError("expected match of {}".format(repr(ex)))
+            j = int(m.group(3))
+            if (j in s): raise ValidationError("not expecting repeated 3rd field")
             s.add(j)
-            if (not line[0].endswith(threads[j][1].name)): raise ValidationError("expected 1st token to end with {}".format(repr(threads[j][1].name)))
-            if (line[1] != '2'): raise ValidationError("expected 2nd token to be 2")
-            if (line[2] != str(j)): raise ValidationError("expected 3rd token to be {}".format(j))
-            if (line[3] != str(j * 2 * 1024**2)): raise ValidationError("expected 4th token to be {}".format(j * 2 * 1024**2))
-            if (line[4] != "{:.3f}".format((j * 2) + 3)): raise ValidationError("expected 5th token to be {:.3f}".format((j * 2) + 3))
-            if (line[5] != "{:.3f}".format(float(j * 2) / ((j * 2) + 3))): raise ValidationError("expected 6th token to be {:.3f}".format(float(j * 2) / ((j * 2) + 3)))
+            ex = "".join((socket.gethostbyname(host), ":", threads[j][1].name))
+            if (m.group(1) != ex): raise ValidationError("expected 1st field to be {}".format(repr(ex)))
+            ex = "2"
+            if (m.group(2) != ex): raise ValidationError("expected 2nd field to be {}".format(repr(ex)))
+            ex = str(j * 2 * 1024**2)
+            if (m.group(4) != ex): raise ValidationError("expected 4th field to be {}".format(repr(ex)))
+            ex = "{:.3f}".format((j * 2) + 3)
+            if (m.group(5) != ex): raise ValidationError("expected 5th field to be {}".format(repr(ex)))
+            ex = "{:.3f}".format(float(j * 2) / ((j * 2) + 3))
+            if (m.group(6) != ex): raise ValidationError("expected 6th field to be {}".format(repr(ex)))
 
         # check that we saw all the mini clients, no more, no less
         if (sorted(s) != range(n)): raise ValidationError("expected range({})".format(n))

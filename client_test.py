@@ -27,6 +27,7 @@ import random
 import subprocess
 import Queue
 import traceback
+import re
 
 class ValidationError(Exception): pass
 
@@ -128,20 +129,15 @@ def main(argv):
                     raise ValidationError("expected stderr")
 
                 # parse stderr to get min run time
-                lines = [line.split() for line in stderr.splitlines()]
+                lines = stderr.splitlines()
                 if (not lines[-1]): del lines[-1]
                 try:
-                    if (len(lines[-1]) != 10): raise ValidationError("expected 10 tokens")
-                    if (lines[-1][0] != "ValueError:"): raise ValidationError("expected 1st token to be 'ValueError:'")
-                    try:
-                        mintime = lines[-1][2]
-                        if (mintime[-1] != 's'): raise ValueError()
-                        mintime = int(mintime[:-1])
-                        if (mintime == 0): mintime = 1
-                        elif (mintime < 0): raise ValueError()
-
-                    except ValueError:
-                        raise ValidationError("expected 3rd token to be minimum run time")
+                    ex = r"^ValueError:\s.*(?<=\s)(\d+)s\b"
+                    m = re.match(ex, lines[-1])
+                    if (not m): raise ValidationError("expected match of {}".format(repr(ex)))
+                    mintime = int(m.group(1))
+                    if (mintime == 0): mintime = 1
+                    elif (mintime < 0): raise ValidationError("not expecting negative time")
 
                 except ValidationError:
                     print("stdout")
@@ -170,9 +166,10 @@ def main(argv):
                 end = time.time()
                 # if we get a mintime error on this run, try again
                 if (clientp.returncode == 2):
-                    lines = [line.split() for line in stderr.splitlines()]
+                    lines = stderr.splitlines()
                     if (not lines[-1]): del lines[-1]
-                    if ((len(lines[-1]) == 10) and (lines[-1][0] == "ValueError:") and (lines[-1][2][-1] == 's')):
+                    ex = r"^ValueError:\s.*(?<=\s)(\d+)s\b"
+                    if (re.match(ex, lines[-1])):
                         print("mintime inconsistency, retrying")
                         continue
 
