@@ -101,7 +101,7 @@ class Handler(SocketServer.StreamRequestHandler):
         client = self.client_address[0]
         message = self.rfile.readline().strip()
         server.logger(": ".join((client, message)))
-        tokens = [token.strip() for token in message.split(':')]
+        tokens = [token.strip() for token in message.split(':', 2)]
         client = (client, tokens[0])
         cmd = tokens[1] if (len(tokens) > 1) else None
         if ((cmd == "DATA") and (len(tokens) > 2)):
