@@ -34,6 +34,8 @@ import random
 import traceback
 import subprocess
 import multiprocessing
+import Queue
+import re
 
 class EventThread(threading.Thread):
     def __init__(self, target = None, name = None, args = (), kwargs = {}):
@@ -95,10 +97,10 @@ class Client(object):
         self.loggerq = multiprocessing.Queue()    # items must be (cmds, message), cmds = '[SWQ]+'
         self.loggerthread = threading.Thread(target = self.logger)
         self.heartbeattimer = RepeatingTimer(5.0, self.heartbeat)
-        self.statustimer = RepeatingTimer(10.0, self.status)
+        self.statustimer = EventThread(args = (10.0,), target = self.status)
         self.workerthread = multiprocessing.Process(target = self.worker, args = (chunk, maxsize, minfiles, delete, self.finish, self.loggerq))
 
-    def write(self, file, message):
+    def logger_write(self, file, message):
         message = ": ".join((time.strftime("%Y-%m-%d %H:%M:%S"), message))
         try:
             file.write(message)
@@ -107,7 +109,7 @@ class Client(object):
         except IOError:
             print(message)
 
-    def sendall(self, file, message):
+    def logger_sendall(self, file, message):
         message = ": ".join((str(os.getpid()), message))
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -119,7 +121,7 @@ class Client(object):
                 sock.shutdown(socket.SHUT_RDWR)
 
         except socket.error as e:
-            self.write(file, ": ".join(("ERROR", str(e))))
+            self.logger_write(file, ": ".join(("ERROR", str(e))))
 
         finally:
             sock.close()
@@ -134,56 +136,104 @@ class Client(object):
                 cmds, message = self.loggerq.get()
                 for cmd in cmds:
                     if (cmd is 'S'):
-                        self.sendall(file, message)
+                        self.logger_sendall(file, message)
 
                     elif (cmd is 'W'):
-                        self.write(file, message)
+                        self.logger_write(file, message)
 
     def heartbeat(self):
         message = "ALIVE"
         self.loggerq.put(('S', message))
 
     # sys.platform may not be granular enough depending on environment expectations
+    # ubuntu
     if (sys.platform == "linux2"):
-        def status(self):
-            message = "STATUS"
-            if (self.workerthread.is_alive()):
-                # run top to get process information on the worker 'thread'
-                # it seems this information may be available via procfs instead, but %CPU seems fidly
-                stdout, stderr = subprocess.Popen(['top', '-p', str(self.workerthread.pid), '-n', '2', '-d', '0.001', '-b'], stdout = subprocess.PIPE, stderr = subprocess.PIPE).communicate()
-                lines = stdout.splitlines()
-                if (not lines[-1]): del lines[-1]
-                if (lines and lines[0].startswith('top -') and (len(lines) >= 2)):
-                    keys = lines[-2].split()
-                    if (keys and (keys[-1] == "COMMAND")):
-                        values = lines[-1].split(None, len(keys) - 1)    # split up to command
-                        data = {k: v for k, v in zip(keys, values)}
-                        message = ": ".join((message, repr(data)))
+        def status_popen(self, interval):
+            # ubuntu top does not put a newline at the end of the last data line
+            # leaving stdout.readline() hanging until the next interval update
+            # by also monitoring top's own pid, we force the first data line to have a newline
+            # assume top's pid is higher than workerthread.pid and use -PID ordering
+            topcmd = ["top", "-p", str(self.workerthread.pid), "-b", "-d", str(interval), "-p", "0", "-o", "-PID"]
+            return subprocess.Popen(topcmd, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
 
-            self.loggerq.put(('S', message))
+        # process stdout lines until data is generated
+        def status_processor(self, line):
+            ex = re.compile(r"^top -\s")
+            while (not ex.match(line)): line = yield
+            ex = re.compile(r"^\s*PID\s+USER\b")
+            while (not ex.match(line)): line = yield
+            keys = line.rstrip().split()
+            line = yield
+            values = line.rstrip().split(None, len(keys) - 1)    # split up to command
+            yield {k: v for k, v in zip(keys, values)}
 
     # macOS
     elif (sys.platform == "darwin"):
-        def status(self):
-            message = "STATUS"
-            if (self.workerthread.is_alive()):
-                stdout, stderr = subprocess.Popen(['top', '-pid', str(self.workerthread.pid), '-l', '2', '-s', '0'], stdout = subprocess.PIPE, stderr = subprocess.PIPE).communicate()
-                lines = stdout.splitlines()
-                if (not lines[-1]): del lines[-1]
-                if (lines and lines[0].startswith('Processes:') and (len(lines) >= 2)):
-                    keys = lines[-2].split()
-                    if (keys and (keys[1] == "COMMAND")):
-                        values = lines[-1].split(None, 1)    # split up to command
-                        values = [values[0]] + values[1].rsplit(None, len(keys) - 2)  # right split back to command
-                        data = {k: v for k, v in zip(keys, values)}
-                        message = ": ".join((message, repr(data)))
+        def status_popen(self, interval):
+            topcmd = ["top", "-pid", str(self.workerthread.pid), "-l", "0", "-s", str(int(round(interval))), "-i", "1"]
+            return subprocess.Popen(topcmd, stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
 
+        # process stdout lines until data is generated
+        def status_processor(self, line):
+            ex = re.compile(r"^Processes:\s")
+            while (not ex.match(line)): line = yield
+            ex = re.compile(r"^\s*PID\s+COMMAND\b")
+            while (not ex.match(line)): line = yield
+            keys = line.rstrip().split()
+            line = yield
+            values = line.rstrip().split(None, 1)    # split up to command
+            values = [values[0]] + values[1].rsplit(None, len(keys) - 2)  # right split back to command
+            yield {k: v for k, v in zip(keys, values)}
+
+    def status(self, interval):
+        thread = threading.current_thread()
+        # send empty STATUS messages every interval seconds until
+        # the workerthread starts and we can start top
+        while True:
+            thread.finished.wait(interval)
+            if (thread.finished.is_set()): return
+            if (hasattr(self, "status_popen") and (self.workerthread.is_alive())):
+                # start top, with data output every interval seconds
+                topp = self.status_popen(interval)
+                break
+
+            message = "STATUS"
             self.loggerq.put(('S', message))
 
-    else:
-        def status(self):
-            message = "STATUS"
-            self.loggerq.put(('S', message))
+        # start a separate thread that waits for stdout lines so we can check for the finished event
+        def readlines():
+            line = topp.stdout.readline()
+            while (line):
+                stdoutq.put(line)
+                line = topp.stdout.readline()
+
+        stdoutq = Queue.Queue()
+        readlinesthread = threading.Thread(target = readlines)
+        readlinesthread.start()
+        while (not thread.finished.is_set()):
+            try:
+                # pass stdout lines to the platform specific processor
+                # if stdout stops producing lines for too long then start over with a new processor
+                line = stdoutq.get(True, 0.5)
+                processor = self.status_processor(line)
+                data = processor.next()
+                while ((data is None) and (not thread.finished.is_set())):
+                    line = stdoutq.get(True, 0.5)
+                    data = processor.send(line)
+
+            except Queue.Empty:
+                pass
+
+            else:
+                # told to finish
+                if (data is None): break
+                # send the data to the server
+                message = ": ".join(("STATUS", repr(data)))
+                self.loggerq.put(('S', message))
+
+        topp.terminate()
+        topp.wait()
+        readlinesthread.join()
 
     @staticmethod
     def worker(chunk, maxsize, minfiles, delete, finish, loggerq):
